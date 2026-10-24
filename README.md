@@ -4,10 +4,11 @@
 
 ---
 
-## ⚡ Быстрая установка (в 1 клик)
+## ⚡ Скачать готовый плагин (Releases)
 
-1. Скачайте готовый файл плагина:  
-   👉 **[Скачать circle_cleaner.plugin](https://raw.githubusercontent.com/Mor4land/circle-cleaner/main/circle_cleaner.plugin)**
+👉 **[Скачать circle_cleaner.plugin (v1.2.0)](https://github.com/Mor4land/circle-cleaner/releases/download/v1.2.0/circle_cleaner.plugin)**
+
+*Страница релиза:* [v1.2.0 Release](https://github.com/Mor4land/circle-cleaner/releases/tag/v1.2.0)
 2. Отправьте скачанный файл себе в **«Избранное» (Saved Messages)** в Telegram/exteraGram.
 3. Нажмите на файл в чате и подтвердите установку: **«Установить плагин» (Install Plugin)**.
 
