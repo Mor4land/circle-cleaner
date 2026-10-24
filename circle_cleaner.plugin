@@ -1,0 +1,480 @@
+"""
+Circle Cleaner Plugin for exteraGram / AyuGram (Android)
+Удаление видеосообщений (кружков) через кнопку меню Plugins в чате или текстовой командой.
+"""
+
+import threading
+import time
+from typing import Any, Dict, List
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from client_utils import send_request
+from java.lang import Integer
+from java.util import ArrayList
+from org.telegram.messenger import MessagesController, UserConfig
+from org.telegram.tgnet import TLRPC
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Switch, Text
+
+try:
+    from android_utils import run_on_ui_thread
+except Exception:
+    def run_on_ui_thread(fn):
+        fn()
+
+try:
+    from org.telegram.ui import LaunchActivity
+except Exception:
+    LaunchActivity = None
+
+try:
+    from org.telegram.ui.ActionBar import AlertDialog
+except Exception:
+    AlertDialog = None
+
+# Безопасная поддержка слушателей кликов без ошибок импорта
+try:
+    from java import dynamic_proxy
+    from android.content import DialogInterface
+
+    class _DialogClickListener(dynamic_proxy(DialogInterface.OnClickListener)):
+        def __init__(self, callback=None):
+            super().__init__()
+            self.callback = callback
+
+        def onClick(self, dialog, which):
+            if dialog:
+                try:
+                    dialog.dismiss()
+                except Exception:
+                    pass
+            if self.callback:
+                self.callback()
+
+    def make_listener(cb):
+        return _DialogClickListener(cb)
+
+except Exception:
+    def make_listener(cb):
+        def _callable(dialog, which):
+            if dialog:
+                try:
+                    dialog.dismiss()
+                except Exception:
+                    pass
+            if cb:
+                cb()
+        return _callable
+
+
+__id__ = "circle_cleaner"
+__name__ = "Circle Cleaner"
+__description__ = "Удаление видеосообщений (кружков) из чата через кнопку меню Plugins"
+__author__ = "VANTA"
+__version__ = "1.2.0"
+__icon__ = "exteraPlugins/1"
+
+
+class CircleCleanerPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+
+        # Добавляем кнопку в меню чата (3 точки -> Plugins -> "Удалить кружочки")
+        try:
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.CHAT_ACTION_MENU,
+                    text="Удалить кружочки",
+                    icon="msg_delete",
+                    priority=100,
+                    on_click=self.on_chat_menu_click,
+                )
+            )
+        except Exception as e:
+            self.logger.warning(f"Could not register CHAT_ACTION_MENU: {e}")
+
+        # Добавляем в контекстное меню сообщения (зажатие сообщения -> Plugins)
+        try:
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                    text="Очистить кружки в чате",
+                    icon="msg_delete",
+                    priority=50,
+                    on_click=self.on_chat_menu_click,
+                )
+            )
+        except Exception as e:
+            self.logger.warning(f"Could not register MESSAGE_CONTEXT_MENU: {e}")
+
+        self._is_running = False
+        self._cancel_requested = False
+        self.logger.info("Circle Cleaner loaded successfully!")
+
+    def on_plugin_unload(self):
+        self._cancel_requested = True
+        self._is_running = False
+        self.logger.info("Circle Cleaner unloaded.")
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Настройки Circle Cleaner"),
+            Switch(
+                key="only_my",
+                text="Удалять только свои кружки по умолчанию",
+                subtext="Если включено, по умолчанию удаляются только ваши кружочки",
+                default=False,
+            ),
+            Switch(
+                key="revoke",
+                text="Удалять для всех участников (Revoke)",
+                subtext="Удалять кружки у обоих собеседников в личных чатах и группах",
+                default=True,
+            ),
+            Divider(),
+            Header(text="Использование"),
+            Text(
+                text="Кнопка в меню чата",
+                subtext="В любом чате нажмите '3 точки' вверху -> 'Plugins' -> 'Удалить кружочки'",
+            ),
+            Text(
+                text="Текстовые команды (опционально)",
+                subtext=".delcircles [all | my] [число]\n.delcircles stop - остановить удаление",
+            ),
+        ]
+
+    def on_chat_menu_click(self, context: Dict[str, Any]):
+        """Обработчик нажатия на кнопку в меню Plugins"""
+        account = context.get("account")
+        if account is None:
+            account = getattr(UserConfig, "selectedAccount", 0)
+
+        dialog_id = (
+            context.get("dialog_id")
+            or context.get("chatId")
+            or context.get("userId")
+        )
+        if dialog_id is None:
+            BulletinHelper.show_error("❌ Не удалось определить ID текущего чата!")
+            return
+
+        fragment = context.get("fragment")
+        activity = (
+            context.get("context")
+            or (fragment.getParentActivity() if fragment else None)
+            or getattr(LaunchActivity, "instance", None)
+        )
+
+        if self._is_running:
+            def show_stop_dialog():
+                if not activity or not AlertDialog:
+                    self._cancel_requested = True
+                    BulletinHelper.show_info("Остановка процесса удаления...")
+                    return
+
+                try:
+                    builder = AlertDialog.Builder(activity)
+                    builder.setTitle("Circle Cleaner")
+                    builder.setMessage("Процесс удаления кружков уже выполняется в фоне.")
+                    builder.setPositiveButton("Остановить", make_listener(self._request_stop))
+                    builder.setNegativeButton("Закрыть", make_listener(None))
+
+                    if fragment and hasattr(fragment, "showDialog"):
+                        fragment.showDialog(builder.create())
+                    else:
+                        builder.show()
+                except Exception as e:
+                    self.logger.error(f"Error showing stop dialog: {e}")
+                    self._cancel_requested = True
+                    BulletinHelper.show_info("Остановка процесса удаления...")
+
+            run_on_ui_thread(show_stop_dialog)
+            return
+
+        # Показываем всплывающее диалоговое окно выбора
+        def show_picker_dialog():
+            if not activity or not AlertDialog:
+                default_only_my = self.get_setting("only_my", False)
+                self._start_cleaning(account, dialog_id, only_my=default_only_my, limit=0)
+                return
+
+            try:
+                builder = AlertDialog.Builder(activity)
+                builder.setTitle("Удаление кружочков")
+                builder.setMessage("Какие видеосообщения (кружки) удалить из этого чата?")
+
+                builder.setPositiveButton(
+                    "Все кружки",
+                    make_listener(lambda: self._start_cleaning(account, dialog_id, only_my=False, limit=0)),
+                )
+                builder.setNegativeButton(
+                    "Только мои",
+                    make_listener(lambda: self._start_cleaning(account, dialog_id, only_my=True, limit=0)),
+                )
+                builder.setNeutralButton("Отмена", make_listener(None))
+
+                if fragment and hasattr(fragment, "showDialog"):
+                    fragment.showDialog(builder.create())
+                else:
+                    builder.show()
+            except Exception as e:
+                self.logger.error(f"Error showing picker dialog: {e}")
+                default_only_my = self.get_setting("only_my", False)
+                self._start_cleaning(account, dialog_id, only_my=default_only_my, limit=0)
+
+        run_on_ui_thread(show_picker_dialog)
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        """Резервный перехват текстовых команд в чате"""
+        text = getattr(params, "message", None)
+        if not isinstance(text, str):
+            return HookResult()
+
+        text_stripped = text.strip()
+        cmd_prefixes = (".delcircles", ".delround", ".rmcircles", ".кружки")
+        matched_prefix = None
+
+        for p in cmd_prefixes:
+            if text_stripped == p or text_stripped.startswith(p + " "):
+                matched_prefix = p
+                break
+
+        if not matched_prefix:
+            return HookResult()
+
+        cancel_result = HookResult()
+        cancel_result.strategy = HookStrategy.CANCEL
+
+        args_str = text_stripped[len(matched_prefix) :].strip()
+        tokens = [t.strip().lower() for t in args_str.split() if t.strip()]
+
+        if "stop" in tokens or "стоп" in tokens:
+            if self._is_running:
+                self._cancel_requested = True
+                BulletinHelper.show_info("Остановка процесса удаления...")
+            else:
+                BulletinHelper.show_info("В данный момент нет активного процесса удаления.")
+            return cancel_result
+
+        if "help" in tokens or "хелп" in tokens or "?" in tokens:
+            BulletinHelper.show_info(
+                "Вызов:\n"
+                "1. Меню '3 точки' в чате -> Plugins -> Удалить кружочки\n"
+                "2. Или команда: .delcircles [all|my] [лимит]"
+            )
+            return cancel_result
+
+        if self._is_running:
+            BulletinHelper.show_error("⚠️ Процесс уже запущен! Напишите .delcircles stop для отмены.")
+            return cancel_result
+
+        only_my = self.get_setting("only_my", False)
+        limit = 0
+
+        for token in tokens:
+            if token in ("my", "мои", "я"):
+                only_my = True
+            elif token in ("all", "все", "всё"):
+                only_my = False
+            elif token.isdigit():
+                limit = int(token)
+
+        peer_id = getattr(params, "peer", None)
+        if peer_id is None:
+            BulletinHelper.show_error("❌ Ошибка: не удалось получить ID чата!")
+            return cancel_result
+
+        self._start_cleaning(account, peer_id, only_my, limit)
+        return cancel_result
+
+    def _request_stop(self):
+        self._cancel_requested = True
+        BulletinHelper.show_info("Остановка процесса удаления...")
+
+    def _start_cleaning(self, account: int, peer_id: int, only_my: bool, limit: int):
+        if self._is_running:
+            BulletinHelper.show_error("⚠️ Процесс уже выполняется!")
+            return
+
+        self._is_running = True
+        self._cancel_requested = False
+
+        threading.Thread(
+            target=self._run_cleaner,
+            args=(account, peer_id, only_my, limit),
+            daemon=True,
+        ).start()
+
+    def _run_cleaner(self, account: int, peer_id: int, only_my: bool, limit: int):
+        try:
+            messages_controller = MessagesController.getInstance(account)
+            input_peer = messages_controller.getInputPeer(peer_id)
+            if not input_peer or isinstance(input_peer, TLRPC.TL_inputPeerEmpty):
+                BulletinHelper.show_error("❌ Ошибка: не удалось определить чат (InputPeer is None)!")
+                return
+
+            mode_str = "только свои" if only_my else "все"
+            limit_str = f" (до {limit} шт.)" if limit > 0 else ""
+            BulletinHelper.show_info(f"🔍 Поиск кружков ({mode_str}){limit_str}...")
+
+            offset_id = 0
+            collected_ids = []
+
+            # 1. Поиск кружков через MTProto
+            while not self._cancel_requested:
+                req = TLRPC.TL_messages_search()
+                req.flags = 0
+                req.peer = input_peer
+                req.q = ""
+                req.filter = TLRPC.TL_inputMessagesFilterRoundVideo()
+                req.min_date = 0
+                req.max_date = 0
+                req.offset_id = offset_id
+                req.add_offset = 0
+                req.limit = 100
+                req.max_id = 0
+                req.min_id = 0
+                req.hash = 0
+
+                try:
+                    res = self._sync_send_request(req, account=account)
+                except Exception as e:
+                    self.logger.error(f"Search request failed: {e}")
+                    BulletinHelper.show_error(f"❌ Ошибка поиска: {e}")
+                    return
+
+                messages = getattr(res, "messages", None)
+                if not messages or messages.isEmpty():
+                    break
+
+                msg_count = messages.size()
+                new_offset = offset_id
+
+                for i in range(msg_count):
+                    if self._cancel_requested:
+                        break
+
+                    msg = messages.get(i)
+                    if not msg:
+                        continue
+
+                    mid = getattr(msg, "id", 0)
+                    if mid > 0:
+                        new_offset = min(new_offset, mid) if new_offset > 0 else mid
+
+                    if not self._is_round_video(msg):
+                        continue
+
+                    is_my = getattr(msg, "out", False)
+                    if only_my and not is_my:
+                        continue
+
+                    collected_ids.append(mid)
+                    if limit > 0 and len(collected_ids) >= limit:
+                        break
+
+                if limit > 0 and len(collected_ids) >= limit:
+                    break
+
+                if msg_count < 100 or new_offset == offset_id:
+                    break
+
+                offset_id = new_offset
+                time.sleep(0.3)
+
+            if self._cancel_requested:
+                BulletinHelper.show_info("⏹️ Поиск отменен.")
+                return
+
+            total_found = len(collected_ids)
+            if total_found == 0:
+                BulletinHelper.show_info(f"ℹ️ Кружков ({mode_str}) в этом чате не найдено.")
+                return
+
+            BulletinHelper.show_info(f"🗑️ Найдено: {total_found} кружков. Удаление...")
+
+            # 2. Пакетное удаление сообщений
+            revoke_flag = self.get_setting("revoke", True)
+            deleted_count = 0
+            chunk_size = 100
+
+            for chunk_start in range(0, total_found, chunk_size):
+                if self._cancel_requested:
+                    BulletinHelper.show_info(f"⏹️ Остановлено. Удалено: {deleted_count}/{total_found}")
+                    return
+
+                chunk = collected_ids[chunk_start : chunk_start + chunk_size]
+
+                java_ids = ArrayList()
+                for mid in chunk:
+                    java_ids.add(Integer.valueOf(int(mid)))
+
+                if isinstance(input_peer, TLRPC.TL_inputPeerChannel):
+                    del_req = TLRPC.TL_channels_deleteMessages()
+                    inp_chan = TLRPC.TL_inputChannel()
+                    inp_chan.channel_id = input_peer.channel_id
+                    inp_chan.access_hash = input_peer.access_hash
+                    del_req.channel = inp_chan
+                    del_req.id = java_ids
+                else:
+                    del_req = TLRPC.TL_messages_deleteMessages()
+                    del_req.revoke = revoke_flag
+                    del_req.id = java_ids
+
+                try:
+                    self._sync_send_request(del_req, account=account)
+                    deleted_count += len(chunk)
+                except Exception as e:
+                    self.logger.error(f"Delete request failed: {e}")
+                    BulletinHelper.show_error(f"❌ Ошибка при удалении: {e}\n(Удалено: {deleted_count})")
+                    return
+
+                time.sleep(0.4)
+
+            BulletinHelper.show_success(f"✅ Готово! Удалено кружков: {deleted_count}")
+
+        finally:
+            self._is_running = False
+            self._cancel_requested = False
+
+    def _is_round_video(self, msg) -> bool:
+        media = getattr(msg, "media", None)
+        if not media:
+            return False
+        doc = getattr(media, "document", None)
+        if not doc:
+            return False
+        attrs = getattr(doc, "attributes", None)
+        if not attrs:
+            return False
+        try:
+            size = attrs.size() if hasattr(attrs, "size") else len(attrs)
+            for i in range(size):
+                attr = attrs.get(i) if hasattr(attrs, "get") else attrs[i]
+                if isinstance(attr, TLRPC.TL_documentAttributeVideo):
+                    if getattr(attr, "round_message", False):
+                        return True
+        except Exception:
+            return True
+        return False
+
+    def _sync_send_request(self, req, account: int, timeout: float = 20.0):
+        event = threading.Event()
+        res_box = {"response": None, "error": None}
+
+        def callback(response, error):
+            res_box["response"] = response
+            res_box["error"] = error
+            event.set()
+
+        send_request(req, callback, account=account)
+
+        if not event.wait(timeout):
+            raise TimeoutError("Таймаут ожидания ответа от серверов Telegram")
+
+        if res_box["error"]:
+            err = res_box["error"]
+            err_text = getattr(err, "text", str(err))
+            raise RuntimeError(err_text)
+
+        return res_box["response"]
