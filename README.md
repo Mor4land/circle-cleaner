@@ -6,9 +6,9 @@
 
 ## ⚡ Скачать готовый плагин (Releases)
 
-👉 **[Скачать circle_cleaner.plugin (v1.3.0)](https://github.com/Mor4land/circle-cleaner/releases/download/v1.3.0/circle_cleaner.plugin)**
+👉 **[Скачать circle_cleaner.plugin (v1.3.1)](https://github.com/Mor4land/circle-cleaner/releases/download/v1.3.1/circle_cleaner.plugin)**
 
-*Страница релиза:* [v1.3.0 Release](https://github.com/Mor4land/circle-cleaner/releases/tag/v1.3.0)
+*Страница релиза:* [v1.3.1 Release](https://github.com/Mor4land/circle-cleaner/releases/tag/v1.3.1)
 
 ### Установка в 1 клик:
 1. Скачайте файл `circle_cleaner.plugin` по ссылке выше.

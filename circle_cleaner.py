@@ -10,9 +10,14 @@ from typing import Any, Dict, List
 from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
 from client_utils import get_last_fragment, get_messages_controller, send_request
 from org.telegram.messenger import MessagesController, UserConfig
-from org.telegram.tgnet import TLRPC
+from org.telegram.tgnet import ConnectionsManager, TLRPC
 from ui.bulletin import BulletinHelper
 from ui.settings import Divider, Header, Switch, Text
+
+try:
+    from client_utils import RequestCallback
+except Exception:
+    RequestCallback = None
 
 try:
     from ui.alert import AlertDialogBuilder
@@ -35,9 +40,10 @@ __id__ = "circle_cleaner"
 __name__ = "Circle Cleaner"
 __description__ = "Удаление видеосообщений (кружков) из чата через кнопку меню Plugins или команду"
 __author__ = "VANTA"
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.0.0"
+__permissions__ = ["network"]
 
 
 class CircleCleanerPlugin(BasePlugin):
@@ -121,7 +127,7 @@ class CircleCleanerPlugin(BasePlugin):
 
         self._is_running = False
         self._cancel_requested = False
-        self.logger.info("Circle Cleaner v1.3.0 loaded successfully!")
+        self.logger.info("Circle Cleaner v1.3.1 loaded successfully!")
 
     def on_plugin_unload(self):
         self._cancel_requested = True
@@ -168,9 +174,9 @@ class CircleCleanerPlugin(BasePlugin):
             or context.get("userId")
         )
         if dialog_id is None and context.get("chat"):
-            dialog_id = getattr(context.get("chat"), "id", None)
-            if dialog_id is not None and dialog_id > 0:
-                dialog_id = -dialog_id
+            c_id = getattr(context.get("chat"), "id", None)
+            if c_id is not None:
+                dialog_id = -c_id if c_id > 0 else c_id
         if dialog_id is None and context.get("user"):
             dialog_id = getattr(context.get("user"), "id", None)
         if dialog_id is None and context.get("message"):
@@ -320,7 +326,7 @@ class CircleCleanerPlugin(BasePlugin):
         ).start()
 
     def _resolve_input_peer(self, account: int, peer_id: int):
-        """Надежное получение InputPeer для MTProto"""
+        """Надежное получение InputPeer для MTProto с поддержкой каналов (-100...)"""
         try:
             controller = get_messages_controller(account)
         except Exception:
@@ -345,17 +351,28 @@ class CircleCleanerPlugin(BasePlugin):
         # 2. Ручная сборка по типу ID
         try:
             if peer_id < 0:
-                chat = controller.getChat(abs(peer_id))
-                if chat:
-                    if getattr(chat, "broadcast", False) or getattr(chat, "megagroup", False):
+                chat_id = abs(peer_id)
+                # Если супергруппа или канал (Telegram ID формата -100xxxxxxxxxx)
+                if chat_id > 1000000000000:
+                    real_channel_id = chat_id - 1000000000000
+                    chat = controller.getChat(real_channel_id)
+                    if chat:
                         inp = TLRPC.TL_inputPeerChannel()
                         inp.channel_id = chat.id
                         inp.access_hash = getattr(chat, "access_hash", 0)
                         return inp
-                    else:
-                        inp = TLRPC.TL_inputPeerChat()
-                        inp.chat_id = chat.id
-                        return inp
+                else:
+                    chat = controller.getChat(chat_id)
+                    if chat:
+                        if getattr(chat, "broadcast", False) or getattr(chat, "megagroup", False):
+                            inp = TLRPC.TL_inputPeerChannel()
+                            inp.channel_id = chat.id
+                            inp.access_hash = getattr(chat, "access_hash", 0)
+                            return inp
+                        else:
+                            inp = TLRPC.TL_inputPeerChat()
+                            inp.chat_id = chat.id
+                            return inp
             else:
                 user = controller.getUser(peer_id)
                 if user:
@@ -382,21 +399,14 @@ class CircleCleanerPlugin(BasePlugin):
             offset_id = 0
             collected_ids = []
 
-            # 1. Поиск видеосообщений через MTProto фильтр RoundVideo
+            # 1. Поиск видеосообщений через MTProto фильтр RoundVoice (надежно поддерживается всеми серверами)
             while not self._cancel_requested:
                 req = TLRPC.TL_messages_search()
-                req.flags = 0
                 req.peer = input_peer
                 req.q = ""
-                req.filter = TLRPC.TL_inputMessagesFilterRoundVideo()
-                req.min_date = 0
-                req.max_date = 0
-                req.offset_id = offset_id
-                req.add_offset = 0
+                req.filter = TLRPC.TL_inputMessagesFilterRoundVoice()
+                req.offset_id = int(offset_id)
                 req.limit = 100
-                req.max_id = 0
-                req.min_id = 0
-                req.hash = 0
 
                 try:
                     res = self._sync_send_request(req, account=account)
@@ -424,6 +434,7 @@ class CircleCleanerPlugin(BasePlugin):
                     if mid > 0:
                         new_offset = min(new_offset, mid) if new_offset > 0 else mid
 
+                    # Строгая проверка: только видеосообщения (кружки), отсекаем обычные голосовые
                     if not self._is_round_video(msg):
                         continue
 
@@ -498,6 +509,7 @@ class CircleCleanerPlugin(BasePlugin):
             self._cancel_requested = False
 
     def _is_round_video(self, msg) -> bool:
+        """Проверяет, является ли сообщение видеосообщением (кружком)"""
         media = getattr(msg, "media", None)
         if not media:
             return False
@@ -515,10 +527,11 @@ class CircleCleanerPlugin(BasePlugin):
                     if getattr(attr, "round_message", False):
                         return True
         except Exception:
-            return True
+            return False
         return False
 
-    def _sync_send_request(self, req, account: int, timeout: float = 20.0):
+    def _sync_send_request(self, req, account: int, timeout: float = 60.0):
+        """Синхронная отправка MTProto запроса с устойчивостью к VPN и переподключениям"""
         event = threading.Event()
         res_box = {"response": None, "error": None}
 
@@ -527,10 +540,63 @@ class CircleCleanerPlugin(BasePlugin):
             res_box["error"] = error
             event.set()
 
-        send_request(req, callback, account=account)
+        if RequestCallback is not None:
+            try:
+                delegate = RequestCallback(callback, account=account)
+            except Exception:
+                delegate = callback
+        else:
+            delegate = callback
 
+        # Проверяем состояние соединения с серверами Telegram
+        try:
+            cm = ConnectionsManager.getInstance(account)
+            state = cm.getConnectionState()
+            # 1 = Connecting, 2 = WaitingForNetwork, 3 = Connected
+            if state != 3:
+                cm.checkConnection()
+        except Exception:
+            pass
+
+        req_id = 0
+        try:
+            req_id = send_request(req, delegate, account=account)
+        except Exception as e:
+            self.logger.warning(f"send_request helper failed: {e}, falling back to direct ConnectionsManager")
+            try:
+                cm = ConnectionsManager.getInstance(account)
+                req_id = cm.sendRequest(req, delegate)
+            except Exception as e2:
+                raise RuntimeError(f"Не удалось отправить запрос в Telegram: {e2}")
+
+        if req_id == 0:
+            try:
+                cm = ConnectionsManager.getInstance(account)
+                req_id = cm.sendRequest(req, delegate)
+            except Exception:
+                pass
+
+        if req_id == 0:
+            raise RuntimeError("Telegram не смог отправить запрос (ConnectionsManager вернул 0). Проверьте интернет-соединение или VPN.")
+
+        # Ожидание ответа с увеличенным таймаутом для медленных VPN
         if not event.wait(timeout):
-            raise TimeoutError("Таймаут ожидания ответа от серверов Telegram")
+            try:
+                cm = ConnectionsManager.getInstance(account)
+                state_now = cm.getConnectionState()
+                state_desc = {
+                    1: "Подключение...",
+                    2: "Ожидание сети",
+                    3: "Подключено",
+                    4: "Подключение к прокси",
+                    5: "Обновление..."
+                }.get(state_now, f"код {state_now}")
+            except Exception:
+                state_desc = "неизвестно"
+            raise TimeoutError(
+                f"Таймаут ожидания ответа ({int(timeout)} сек). Статус сети Telegram: {state_desc}. "
+                "Если включен VPN, убедитесь, что вверху Telegram горит 'Обновлено', а не 'Соединение...'"
+            )
 
         if res_box["error"]:
             err = res_box["error"]
