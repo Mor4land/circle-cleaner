@@ -1,7 +1,7 @@
 """
 Circle Cleaner Plugin for exteraGram / AyuGram (Android)
 Удаление видеосообщений (кружков) через кнопку Plugins в чате или текстовой командой.
-Построен на нативном механизме Telegram MessagesController.deleteMessages.
+Построен на нативном механизме Telegram MessagesController.deleteMessages с защитой от ошибок сигнатур.
 """
 
 import threading
@@ -13,7 +13,7 @@ from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, Menu
 from client_utils import get_last_fragment, get_messages_controller, get_user_config, send_request
 from java.lang import Integer, Long
 from java.util import ArrayList
-from org.telegram.messenger import ChatObject, UserConfig
+from org.telegram.messenger import ChatObject, MessagesController, UserConfig
 from org.telegram.tgnet import TLRPC
 from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
@@ -29,7 +29,7 @@ __id__ = "circle_cleaner"
 __name__ = "Circle Cleaner"
 __description__ = "Удаление видеосообщений (кружков) из чата через кнопку меню Plugins или команду"
 __author__ = "VANTA"
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.0.0"
 __permissions__ = ["network"]
@@ -87,7 +87,7 @@ class CircleCleanerPlugin(BasePlugin):
         self._is_running = False
         self._cancel_requested = False
         self._progress_builder = None
-        self.logger.info("Circle Cleaner v1.5.0 loaded successfully!")
+        self.logger.info("Circle Cleaner v1.5.1 loaded successfully!")
 
     def on_plugin_unload(self):
         self._cancel_requested = True
@@ -366,20 +366,63 @@ class CircleCleanerPlugin(BasePlugin):
             raise RuntimeError(err_text)
 
     def delete_batch(self, account: int, dialog_id: int, ids_list: List[int], revoke: bool = True):
-        """Удаление пачки сообщений через нативный Telegram MessagesController.deleteMessages"""
+        """Удаление пачки сообщений с многоуровневой защитой от ошибок типов"""
         controller = get_messages_controller(account)
+        if not controller:
+            controller = MessagesController.getInstance(account)
+
         ids = ArrayList()
         for message_id in ids_list:
             ids.add(Integer(int(message_id)))
 
+        did = int(dialog_id)
         done = threading.Event()
         errors = []
 
         def task():
             try:
-                controller.deleteMessages(ids, None, None, Long(dialog_id), 0, revoke, 0)
-            except Exception as e:
-                errors.append(e)
+                # 1. Точный вызов нативного метода Telegram (как в del_my_msgs)
+                try:
+                    controller.deleteMessages(ids, None, None, did, 0, bool(revoke), 0)
+                    return
+                except Exception as e1:
+                    log(f"[CC] deleteMessages attempt 1 error: {e1}")
+
+                # 2. Вызов без параметра topicId (для сборок без поддержки тем/форумов)
+                try:
+                    controller.deleteMessages(ids, None, None, did, bool(revoke), 0)
+                    return
+                except Exception as e2:
+                    log(f"[CC] deleteMessages attempt 2 error: {e2}")
+
+                # 3. Вызов с явной Long оберткой
+                try:
+                    controller.deleteMessages(ids, None, None, Long(did), 0, bool(revoke), 0)
+                    return
+                except Exception as e3:
+                    log(f"[CC] deleteMessages attempt 3 error: {e3}")
+
+                # 4. Резервный MTProto-запрос если контроллер отклонил все сигнатуры
+                is_chan = (did < 0 and abs(did) > 1000000000000)
+                if is_chan:
+                    chan_id = abs(did) - 1000000000000
+                    chat = controller.getChat(Long(chan_id))
+                    del_req = TLRPC.TL_channels_deleteMessages()
+                    inp_chan = TLRPC.TL_inputChannel()
+                    inp_chan.channel_id = chan_id
+                    inp_chan.access_hash = getattr(chat, "access_hash", 0) if chat else 0
+                    del_req.channel = inp_chan
+                    for mid in ids_list:
+                        del_req.id.add(Integer(int(mid)))
+                else:
+                    del_req = TLRPC.TL_messages_deleteMessages()
+                    del_req.revoke = bool(revoke)
+                    for mid in ids_list:
+                        del_req.id.add(Integer(int(mid)))
+
+                self.request(del_req, account=account)
+            except Exception as e_final:
+                errors.append(e_final)
             finally:
                 done.set()
 
@@ -388,6 +431,44 @@ class CircleCleanerPlugin(BasePlugin):
         if errors:
             raise errors[0]
 
+    def _resolve_peer(self, controller, dialog_id: int):
+        """Безопасное получение InputPeer"""
+        did = int(dialog_id)
+        try:
+            peer = controller.getInputPeer(did)
+            if peer and not isinstance(peer, TLRPC.TL_inputPeerEmpty):
+                return peer
+        except Exception:
+            pass
+
+        # Ручная сборка если getInputPeer вернул Empty
+        if did < 0:
+            chat_id = abs(did)
+            if chat_id > 1000000000000:
+                real_cid = chat_id - 1000000000000
+                chat = controller.getChat(Long(real_cid))
+                peer = TLRPC.TL_inputPeerChannel()
+                peer.channel_id = real_cid
+                peer.access_hash = getattr(chat, "access_hash", 0) if chat else 0
+                return peer
+            else:
+                chat = controller.getChat(Long(chat_id))
+                if chat and (getattr(chat, "broadcast", False) or getattr(chat, "megagroup", False)):
+                    peer = TLRPC.TL_inputPeerChannel()
+                    peer.channel_id = chat.id
+                    peer.access_hash = getattr(chat, "access_hash", 0)
+                    return peer
+                else:
+                    peer = TLRPC.TL_inputPeerChat()
+                    peer.chat_id = chat_id
+                    return peer
+        else:
+            user = controller.getUser(Long(did))
+            peer = TLRPC.TL_inputPeerUser()
+            peer.user_id = did
+            peer.access_hash = getattr(user, "access_hash", 0) if user else 0
+            return peer
+
     def _run_cleaner(self, account: int, dialog_id: int, only_my: bool, limit: int):
         try:
             mode_str = "только свои" if only_my else "все"
@@ -395,12 +476,16 @@ class CircleCleanerPlugin(BasePlugin):
             self._update_progress(f"🔍 Поиск кружков ({mode_str}){limit_str}...")
 
             controller = get_messages_controller(account)
+            if not controller:
+                controller = MessagesController.getInstance(account)
+
+            input_peer = self._resolve_peer(controller, dialog_id)
             seen = set()
             collected_ids = []
             scanned_total = 0
             max_date = 0
 
-            # 1. Проверяем, работает ли в этом чате быстрый фильтр RoundVideo
+            # 1. Проверяем, работает ли быстрый фильтр RoundVideo
             filter_cls = (
                 getattr(TLRPC, "TL_inputMessagesFilterRoundVideo", None)
                 or getattr(TLRPC, "TL_inputMessagesFilterRoundVoice", None)
@@ -410,7 +495,7 @@ class CircleCleanerPlugin(BasePlugin):
             if filter_cls:
                 try:
                     req = TLRPC.TL_messages_search()
-                    req.peer = controller.getInputPeer(dialog_id)
+                    req.peer = input_peer
                     req.q = ""
                     req.filter = filter_cls()
                     req.limit = 100
@@ -429,13 +514,13 @@ class CircleCleanerPlugin(BasePlugin):
                 except Exception as e:
                     self.logger.warning(f"Fast search probe: {e}")
 
-            # Если быстрый фильтр вернул кружки — используем его, иначе используем полный поиск Empty (100% покрытие)
+            # Если быстрый фильтр нашел кружки — используем его, иначе полный поиск Empty (100% покрытие)
             target_filter = filter_cls() if (filter_cls and fast_search_worked) else TLRPC.TL_inputMessagesFilterEmpty()
 
             if not fast_search_worked:
                 self._update_progress(f"🔍 Сканирование сообщений чата ({mode_str})...")
 
-            # 2. Постраничное сканирование сообщений через сдвиг даты max_date
+            # 2. Постраничное сканирование сообщений через сдвиг дат max_date
             while not self._cancel_requested:
                 before = len(seen)
                 window_min_date = None
@@ -443,7 +528,7 @@ class CircleCleanerPlugin(BasePlugin):
 
                 while not self._cancel_requested:
                     req = TLRPC.TL_messages_search()
-                    req.peer = controller.getInputPeer(dialog_id)
+                    req.peer = input_peer
                     req.q = ""
                     req.filter = target_filter
                     req.limit = 100
@@ -520,7 +605,7 @@ class CircleCleanerPlugin(BasePlugin):
                 BulletinHelper.show_info(f"ℹ️ Кружков ({mode_str}) в этом чате не найдено.")
                 return
 
-            # 3. Удаление сообщений через нативный controller.deleteMessages
+            # 3. Удаление сообщений через надежный delete_batch
             revoke_flag = self.get_setting("revoke", True)
             deleted_count = 0
             chunk_size = 100
