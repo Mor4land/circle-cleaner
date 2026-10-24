@@ -40,7 +40,7 @@ __id__ = "circle_cleaner"
 __name__ = "Circle Cleaner"
 __description__ = "Удаление видеосообщений (кружков) из чата через кнопку меню Plugins или команду"
 __author__ = "VANTA"
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.0.0"
 __permissions__ = ["network"]
@@ -127,11 +127,13 @@ class CircleCleanerPlugin(BasePlugin):
 
         self._is_running = False
         self._cancel_requested = False
-        self.logger.info("Circle Cleaner v1.3.1 loaded successfully!")
+        self._progress_builder = None
+        self.logger.info("Circle Cleaner v1.4.0 loaded successfully!")
 
     def on_plugin_unload(self):
         self._cancel_requested = True
         self._is_running = False
+        self._dismiss_progress()
         self.logger.info("Circle Cleaner unloaded.")
 
     def create_settings(self) -> List[Any]:
@@ -167,7 +169,7 @@ class CircleCleanerPlugin(BasePlugin):
         if account is None:
             account = getattr(UserConfig, "selectedAccount", 0)
 
-        # Извлечение ID чата из всех возможных полей контекста
+        # Извлечение ID чата из контекста
         dialog_id = (
             context.get("dialog_id")
             or context.get("chatId")
@@ -197,7 +199,7 @@ class CircleCleanerPlugin(BasePlugin):
             or getattr(LaunchActivity, "instance", None)
         )
 
-        # 1. Если удаление уже выполняется в фоне - предлагаем остановить
+        # Если уже выполняется - показываем диалог остановки
         if self._is_running:
             def show_stop_dialog():
                 if not activity or not AlertDialogBuilder:
@@ -208,7 +210,7 @@ class CircleCleanerPlugin(BasePlugin):
                 try:
                     builder = AlertDialogBuilder(activity)
                     builder.set_title("Circle Cleaner")
-                    builder.set_message("Процесс удаления кружков уже выполняется в фоне.")
+                    builder.set_message("Процесс удаления кружков уже выполняется.")
                     builder.set_positive_button(
                         "Остановить",
                         lambda bld, which: (bld.dismiss(), self._request_stop())
@@ -222,11 +224,11 @@ class CircleCleanerPlugin(BasePlugin):
             run_on_ui_thread(show_stop_dialog)
             return
 
-        # 2. Показываем всплывающий диалог выбора режима удаления
+        # Показываем всплывающий диалог выбора режима удаления
         def show_picker_dialog():
             if not activity or not AlertDialogBuilder:
                 default_only_my = self.get_setting("only_my", False)
-                self._start_cleaning(account, dialog_id, only_my=default_only_my, limit=0)
+                self._start_cleaning(activity, account, dialog_id, only_my=default_only_my, limit=0)
                 return
 
             try:
@@ -238,14 +240,14 @@ class CircleCleanerPlugin(BasePlugin):
                     "Все кружки",
                     lambda bld, which: (
                         bld.dismiss(),
-                        self._start_cleaning(account, dialog_id, only_my=False, limit=0)
+                        self._start_cleaning(activity, account, dialog_id, only_my=False, limit=0)
                     )
                 )
                 builder.set_negative_button(
                     "Только мои",
                     lambda bld, which: (
                         bld.dismiss(),
-                        self._start_cleaning(account, dialog_id, only_my=True, limit=0)
+                        self._start_cleaning(activity, account, dialog_id, only_my=True, limit=0)
                     )
                 )
                 builder.set_neutral_button("Отмена", lambda bld, which: bld.dismiss())
@@ -253,7 +255,7 @@ class CircleCleanerPlugin(BasePlugin):
             except Exception as e:
                 self.logger.error(f"Error showing picker dialog: {e}")
                 default_only_my = self.get_setting("only_my", False)
-                self._start_cleaning(account, dialog_id, only_my=default_only_my, limit=0)
+                self._start_cleaning(activity, account, dialog_id, only_my=default_only_my, limit=0)
 
         run_on_ui_thread(show_picker_dialog)
 
@@ -304,20 +306,59 @@ class CircleCleanerPlugin(BasePlugin):
             BulletinHelper.show_error("❌ Ошибка: не удалось получить ID чата!")
             return cancel_result
 
-        self._start_cleaning(account, peer_id, only_my, limit)
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else getattr(LaunchActivity, "instance", None)
+        self._start_cleaning(activity, account, peer_id, only_my, limit)
         return cancel_result
 
     def _request_stop(self):
         self._cancel_requested = True
-        BulletinHelper.show_info("Остановка процесса удаления...")
+        self._update_progress("⏹️ Остановка процесса удаления...")
 
-    def _start_cleaning(self, account: int, peer_id: int, only_my: bool, limit: int):
+    def _show_progress(self, activity, title: str, initial_text: str):
+        if not activity or not AlertDialogBuilder:
+            return None
+        try:
+            builder = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+            builder.set_title(title)
+            builder.set_message(initial_text)
+            builder.set_positive_button(
+                "Остановить",
+                lambda bld, which: (bld.dismiss(), self._request_stop())
+            )
+            builder.show()
+            builder.set_cancelable(True)
+            builder.set_on_back_button_listener(lambda bld, which: (bld.dismiss(), self._request_stop()))
+            return builder
+        except Exception as e:
+            self.logger.warning(f"Could not show progress dialog: {e}")
+            return None
+
+    def _update_progress(self, text: str):
+        if self._progress_builder:
+            run_on_ui_thread(lambda: self._progress_builder.set_message(text))
+        else:
+            BulletinHelper.show_info(text)
+
+    def _dismiss_progress(self):
+        if self._progress_builder:
+            run_on_ui_thread(lambda: self._progress_builder.dismiss())
+            self._progress_builder = None
+
+    def _start_cleaning(self, activity, account: int, peer_id: int, only_my: bool, limit: int):
         if self._is_running:
             BulletinHelper.show_error("⚠️ Процесс уже выполняется!")
             return
 
         self._is_running = True
         self._cancel_requested = False
+
+        # Открываем диалоговое окно прогресса
+        self._progress_builder = self._show_progress(
+            activity,
+            "Circle Cleaner",
+            "Инициализация поиска видеосообщений..."
+        )
 
         threading.Thread(
             target=self._run_cleaner,
@@ -326,7 +367,7 @@ class CircleCleanerPlugin(BasePlugin):
         ).start()
 
     def _resolve_input_peer(self, account: int, peer_id: int):
-        """Надежное получение InputPeer для MTProto с поддержкой каналов (-100...)"""
+        """Надежное получение InputPeer для MTProto"""
         try:
             controller = get_messages_controller(account)
         except Exception:
@@ -352,7 +393,7 @@ class CircleCleanerPlugin(BasePlugin):
         try:
             if peer_id < 0:
                 chat_id = abs(peer_id)
-                # Если супергруппа или канал (Telegram ID формата -100xxxxxxxxxx)
+                # Если супергруппа или канал (-100xxxxxxxxxx)
                 if chat_id > 1000000000000:
                     real_channel_id = chat_id - 1000000000000
                     chat = controller.getChat(real_channel_id)
@@ -385,21 +426,83 @@ class CircleCleanerPlugin(BasePlugin):
 
         return None
 
+    def _send_mtproto(self, req, account: int, timeout: float = 15.0):
+        """
+        Отправка MTProto запроса с частым освобождением GIL (time.sleep)
+        для предотвращения дедлоков в Chaquopy на фоновом потоке.
+        """
+        box = {"response": None, "error": None, "done": False}
+
+        def on_complete(response, error):
+            box["response"] = response
+            box["error"] = error
+            box["done"] = True
+
+        if RequestCallback is not None:
+            try:
+                delegate = RequestCallback(on_complete, account=account)
+            except Exception:
+                delegate = on_complete
+        else:
+            delegate = on_complete
+
+        req_id = 0
+        try:
+            req_id = send_request(req, delegate, account=account)
+        except Exception as e:
+            self.logger.warning(f"send_request helper failed ({e}), using ConnectionsManager")
+
+        if req_id == 0:
+            try:
+                cm = ConnectionsManager.getInstance(account)
+                req_id = cm.sendRequest(req, delegate)
+            except Exception as e2:
+                raise RuntimeError(f"Не удалось отправить запрос: {e2}")
+
+        if req_id == 0:
+            raise RuntimeError("Telegram отклонил отправку запроса (код 0).")
+
+        # Цикл ожидания с регулярным сбросом GIL
+        start_t = time.time()
+        while not box["done"] and not self._cancel_requested:
+            if time.time() - start_t > timeout:
+                raise TimeoutError(f"Сервер не ответил за {int(timeout)} сек.")
+            time.sleep(0.08)
+
+        if self._cancel_requested:
+            raise RuntimeError("Остановлено пользователем.")
+
+        if box["error"]:
+            err = box["error"]
+            err_text = getattr(err, "text", str(err))
+            raise RuntimeError(err_text)
+
+        return box["response"]
+
     def _run_cleaner(self, account: int, peer_id: int, only_my: bool, limit: int):
         try:
+            # 1. Проверяем сеть
+            try:
+                cm = ConnectionsManager.getInstance(account)
+                cm.checkConnection()
+            except Exception:
+                pass
+
             input_peer = self._resolve_input_peer(account, peer_id)
             if not input_peer:
+                self._dismiss_progress()
                 BulletinHelper.show_error("❌ Ошибка: не удалось получить данные чата (InputPeer is None)!")
                 return
 
             mode_str = "только свои" if only_my else "все"
             limit_str = f" (до {limit} шт.)" if limit > 0 else ""
-            BulletinHelper.show_info(f"🔍 Поиск кружков ({mode_str}){limit_str}...")
+            self._update_progress(f"🔍 Поиск кружков ({mode_str}){limit_str}...")
 
-            offset_id = 0
             collected_ids = []
+            used_fallback = False
 
-            # 1. Поиск видеосообщений через MTProto фильтр RoundVoice (надежно поддерживается всеми серверами)
+            # 2. Первичный поиск через TL_messages_search
+            offset_id = 0
             while not self._cancel_requested:
                 req = TLRPC.TL_messages_search()
                 req.peer = input_peer
@@ -409,11 +512,11 @@ class CircleCleanerPlugin(BasePlugin):
                 req.limit = 100
 
                 try:
-                    res = self._sync_send_request(req, account=account)
+                    res = self._send_mtproto(req, account=account, timeout=10.0)
                 except Exception as e:
-                    self.logger.error(f"Search request failed: {e}")
-                    BulletinHelper.show_error(f"❌ Ошибка поиска: {e}")
-                    return
+                    self.logger.warning(f"Filter search timed out or failed: {e}. Switching to chat history scan.")
+                    used_fallback = True
+                    break
 
                 messages = getattr(res, "messages", None)
                 if not messages or messages.isEmpty():
@@ -434,49 +537,110 @@ class CircleCleanerPlugin(BasePlugin):
                     if mid > 0:
                         new_offset = min(new_offset, mid) if new_offset > 0 else mid
 
-                    # Строгая проверка: только видеосообщения (кружки), отсекаем обычные голосовые
                     if not self._is_round_video(msg):
                         continue
 
-                    is_my = getattr(msg, "out", False)
-                    if only_my and not is_my:
+                    if only_my and not getattr(msg, "out", False):
                         continue
 
                     collected_ids.append(mid)
                     if limit > 0 and len(collected_ids) >= limit:
                         break
 
+                self._update_progress(f"🔍 Поиск кружков...\nНайдено: {len(collected_ids)}")
+
                 if limit > 0 and len(collected_ids) >= limit:
                     break
-
                 if msg_count < 100 or new_offset == offset_id:
                     break
 
                 offset_id = new_offset
-                time.sleep(0.3)
+                time.sleep(0.1)
+
+            # 3. Фоллбэк: если серверный поиск не ответил из-за VPN, сканируем историю напрямую через getHistory
+            if used_fallback and not self._cancel_requested:
+                self._update_progress("Поиск по фильтру не ответил.\nСканирование истории сообщений...")
+                offset_id = 0
+                scanned_total = 0
+
+                while not self._cancel_requested:
+                    h_req = TLRPC.TL_messages_getHistory()
+                    h_req.peer = input_peer
+                    h_req.offset_id = int(offset_id)
+                    h_req.offset_date = 0
+                    h_req.add_offset = 0
+                    h_req.limit = 100
+                    h_req.max_id = 0
+                    h_req.min_id = 0
+                    h_req.hash = 0
+
+                    try:
+                        h_res = self._send_mtproto(h_req, account=account, timeout=12.0)
+                    except Exception as e:
+                        self.logger.error(f"getHistory failed: {e}")
+                        break
+
+                    msgs = getattr(h_res, "messages", None)
+                    if not msgs or msgs.isEmpty():
+                        break
+
+                    m_count = msgs.size()
+                    new_offset = offset_id
+
+                    for i in range(m_count):
+                        m = msgs.get(i)
+                        scanned_total += 1
+                        mid = getattr(m, "id", 0)
+                        if mid > 0:
+                            new_offset = min(new_offset, mid) if new_offset > 0 else mid
+
+                        if not self._is_round_video(m):
+                            continue
+                        if only_my and not getattr(m, "out", False):
+                            continue
+
+                        collected_ids.append(mid)
+                        if limit > 0 and len(collected_ids) >= limit:
+                            break
+
+                    self._update_progress(
+                        f"Сканирование истории...\nПроверено сообщений: {scanned_total}\nНайдено кружков: {len(collected_ids)}"
+                    )
+
+                    if limit > 0 and len(collected_ids) >= limit:
+                        break
+                    if m_count < 100 or new_offset == offset_id:
+                        break
+
+                    offset_id = new_offset
+                    time.sleep(0.1)
 
             if self._cancel_requested:
+                self._dismiss_progress()
                 BulletinHelper.show_info("⏹️ Поиск отменен.")
                 return
 
             total_found = len(collected_ids)
             if total_found == 0:
+                self._dismiss_progress()
                 BulletinHelper.show_info(f"ℹ️ Кружков ({mode_str}) в этом чате не найдено.")
                 return
 
-            BulletinHelper.show_info(f"🗑️ Найдено: {total_found} кружков. Удаление...")
-
-            # 2. Пакетное удаление сообщений
+            # 4. Пакетное удаление сообщений
             revoke_flag = self.get_setting("revoke", True)
             deleted_count = 0
             chunk_size = 100
 
             for chunk_start in range(0, total_found, chunk_size):
                 if self._cancel_requested:
-                    BulletinHelper.show_info(f"⏹️ Остановлено. Удалено: {deleted_count}/{total_found}")
-                    return
+                    break
 
                 chunk = collected_ids[chunk_start : chunk_start + chunk_size]
+                percent = int((deleted_count / total_found) * 100) if total_found > 0 else 0
+                self._update_progress(
+                    f"🗑️ Удаление кружков: {deleted_count}/{total_found} ({percent}%)\n"
+                    f"Пачка {chunk_start // chunk_size + 1} из {(total_found + chunk_size - 1) // chunk_size}..."
+                )
 
                 if isinstance(input_peer, TLRPC.TL_inputPeerChannel):
                     del_req = TLRPC.TL_channels_deleteMessages()
@@ -493,20 +657,32 @@ class CircleCleanerPlugin(BasePlugin):
                         del_req.id.add(int(mid))
 
                 try:
-                    self._sync_send_request(del_req, account=account)
+                    self._send_mtproto(del_req, account=account, timeout=15.0)
                     deleted_count += len(chunk)
                 except Exception as e:
                     self.logger.error(f"Delete request failed: {e}")
+                    self._dismiss_progress()
                     BulletinHelper.show_error(f"❌ Ошибка при удалении: {e}\n(Удалено: {deleted_count})")
                     return
 
-                time.sleep(0.4)
+                time.sleep(0.3)
 
-            BulletinHelper.show_success(f"✅ Готово! Удалено кружков: {deleted_count}")
+            self._dismiss_progress()
+
+            if self._cancel_requested:
+                BulletinHelper.show_info(f"⏹️ Остановлено. Удалено: {deleted_count}/{total_found}")
+            else:
+                BulletinHelper.show_success(f"✅ Готово! Удалено кружков: {deleted_count}")
+
+        except Exception as global_err:
+            self._dismiss_progress()
+            self.logger.error(f"Cleaner unhandled error: {global_err}")
+            BulletinHelper.show_error(f"❌ Ошибка: {global_err}")
 
         finally:
             self._is_running = False
             self._cancel_requested = False
+            self._dismiss_progress()
 
     def _is_round_video(self, msg) -> bool:
         """Проверяет, является ли сообщение видеосообщением (кружком)"""
@@ -529,78 +705,3 @@ class CircleCleanerPlugin(BasePlugin):
         except Exception:
             return False
         return False
-
-    def _sync_send_request(self, req, account: int, timeout: float = 60.0):
-        """Синхронная отправка MTProto запроса с устойчивостью к VPN и переподключениям"""
-        event = threading.Event()
-        res_box = {"response": None, "error": None}
-
-        def callback(response, error):
-            res_box["response"] = response
-            res_box["error"] = error
-            event.set()
-
-        if RequestCallback is not None:
-            try:
-                delegate = RequestCallback(callback, account=account)
-            except Exception:
-                delegate = callback
-        else:
-            delegate = callback
-
-        # Проверяем состояние соединения с серверами Telegram
-        try:
-            cm = ConnectionsManager.getInstance(account)
-            state = cm.getConnectionState()
-            # 1 = Connecting, 2 = WaitingForNetwork, 3 = Connected
-            if state != 3:
-                cm.checkConnection()
-        except Exception:
-            pass
-
-        req_id = 0
-        try:
-            req_id = send_request(req, delegate, account=account)
-        except Exception as e:
-            self.logger.warning(f"send_request helper failed: {e}, falling back to direct ConnectionsManager")
-            try:
-                cm = ConnectionsManager.getInstance(account)
-                req_id = cm.sendRequest(req, delegate)
-            except Exception as e2:
-                raise RuntimeError(f"Не удалось отправить запрос в Telegram: {e2}")
-
-        if req_id == 0:
-            try:
-                cm = ConnectionsManager.getInstance(account)
-                req_id = cm.sendRequest(req, delegate)
-            except Exception:
-                pass
-
-        if req_id == 0:
-            raise RuntimeError("Telegram не смог отправить запрос (ConnectionsManager вернул 0). Проверьте интернет-соединение или VPN.")
-
-        # Ожидание ответа с увеличенным таймаутом для медленных VPN
-        if not event.wait(timeout):
-            try:
-                cm = ConnectionsManager.getInstance(account)
-                state_now = cm.getConnectionState()
-                state_desc = {
-                    1: "Подключение...",
-                    2: "Ожидание сети",
-                    3: "Подключено",
-                    4: "Подключение к прокси",
-                    5: "Обновление..."
-                }.get(state_now, f"код {state_now}")
-            except Exception:
-                state_desc = "неизвестно"
-            raise TimeoutError(
-                f"Таймаут ожидания ответа ({int(timeout)} сек). Статус сети Telegram: {state_desc}. "
-                "Если включен VPN, убедитесь, что вверху Telegram горит 'Обновлено', а не 'Соединение...'"
-            )
-
-        if res_box["error"]:
-            err = res_box["error"]
-            err_text = getattr(err, "text", str(err))
-            raise RuntimeError(err_text)
-
-        return res_box["response"]
