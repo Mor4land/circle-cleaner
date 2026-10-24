@@ -40,7 +40,7 @@ __id__ = "circle_cleaner"
 __name__ = "Circle Cleaner"
 __description__ = "Удаление видеосообщений (кружков) из чата через кнопку меню Plugins или команду"
 __author__ = "VANTA"
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.0.0"
 __permissions__ = ["network"]
@@ -128,7 +128,7 @@ class CircleCleanerPlugin(BasePlugin):
         self._is_running = False
         self._cancel_requested = False
         self._progress_builder = None
-        self.logger.info("Circle Cleaner v1.4.0 loaded successfully!")
+        self.logger.info("Circle Cleaner v1.4.1 loaded successfully!")
 
     def on_plugin_unload(self):
         self._cancel_requested = True
@@ -169,30 +169,53 @@ class CircleCleanerPlugin(BasePlugin):
         if account is None:
             account = getattr(UserConfig, "selectedAccount", 0)
 
-        # Извлечение ID чата из контекста
+        # 1. Извлечение объектов Chat / User напрямую из context
+        raw_chat = context.get("chat")
+        raw_user = context.get("user")
+        raw_msg = context.get("message")
+        fragment = context.get("fragment") or get_last_fragment()
+
+        if not raw_chat and not raw_user and fragment:
+            try:
+                if hasattr(fragment, "getCurrentChat"):
+                    raw_chat = fragment.getCurrentChat()
+                if hasattr(fragment, "getCurrentUser"):
+                    raw_user = fragment.getCurrentUser()
+            except Exception:
+                pass
+
+        # 2. Определение dialog_id
         dialog_id = (
             context.get("dialog_id")
             or context.get("chatId")
             or context.get("userId")
         )
-        if dialog_id is None and context.get("chat"):
-            c_id = getattr(context.get("chat"), "id", None)
-            if c_id is not None:
-                dialog_id = -c_id if c_id > 0 else c_id
-        if dialog_id is None and context.get("user"):
-            dialog_id = getattr(context.get("user"), "id", None)
-        if dialog_id is None and context.get("message"):
-            dialog_id = getattr(context.get("message"), "dialog_id", None)
-        if dialog_id is None:
-            fragment = context.get("fragment") or get_last_fragment()
-            if fragment and hasattr(fragment, "getDialogId"):
+        if dialog_id is None and raw_msg:
+            dialog_id = getattr(raw_msg, "dialog_id", None)
+
+        if dialog_id is None and fragment and hasattr(fragment, "getDialogId"):
+            try:
                 dialog_id = fragment.getDialogId()
+            except Exception:
+                pass
 
         if dialog_id is None:
+            if raw_chat:
+                cid = getattr(raw_chat, "id", None)
+                if cid is not None:
+                    try:
+                        from org.telegram.messenger import ChatObject
+                        is_c = ChatObject.isChannel(raw_chat)
+                    except Exception:
+                        is_c = getattr(raw_chat, "broadcast", False) or getattr(raw_chat, "megagroup", False)
+                    dialog_id = (-1000000000000 - cid) if is_c else -cid
+            elif raw_user:
+                dialog_id = getattr(raw_user, "id", None)
+
+        if dialog_id is None and not raw_chat and not raw_user:
             BulletinHelper.show_info("ℹ️ Откройте чат и выберите 'Удалить кружочки' в меню (3 точки) или зажмите любое сообщение.")
             return
 
-        fragment = context.get("fragment") or get_last_fragment()
         activity = (
             context.get("context")
             or (fragment.getParentActivity() if fragment else None)
@@ -228,7 +251,10 @@ class CircleCleanerPlugin(BasePlugin):
         def show_picker_dialog():
             if not activity or not AlertDialogBuilder:
                 default_only_my = self.get_setting("only_my", False)
-                self._start_cleaning(activity, account, dialog_id, only_my=default_only_my, limit=0)
+                self._start_cleaning(
+                    activity, account, dialog_id, only_my=default_only_my, limit=0,
+                    raw_chat=raw_chat, raw_user=raw_user
+                )
                 return
 
             try:
@@ -240,14 +266,20 @@ class CircleCleanerPlugin(BasePlugin):
                     "Все кружки",
                     lambda bld, which: (
                         bld.dismiss(),
-                        self._start_cleaning(activity, account, dialog_id, only_my=False, limit=0)
+                        self._start_cleaning(
+                            activity, account, dialog_id, only_my=False, limit=0,
+                            raw_chat=raw_chat, raw_user=raw_user
+                        )
                     )
                 )
                 builder.set_negative_button(
                     "Только мои",
                     lambda bld, which: (
                         bld.dismiss(),
-                        self._start_cleaning(activity, account, dialog_id, only_my=True, limit=0)
+                        self._start_cleaning(
+                            activity, account, dialog_id, only_my=True, limit=0,
+                            raw_chat=raw_chat, raw_user=raw_user
+                        )
                     )
                 )
                 builder.set_neutral_button("Отмена", lambda bld, which: bld.dismiss())
@@ -255,7 +287,10 @@ class CircleCleanerPlugin(BasePlugin):
             except Exception as e:
                 self.logger.error(f"Error showing picker dialog: {e}")
                 default_only_my = self.get_setting("only_my", False)
-                self._start_cleaning(activity, account, dialog_id, only_my=default_only_my, limit=0)
+                self._start_cleaning(
+                    activity, account, dialog_id, only_my=default_only_my, limit=0,
+                    raw_chat=raw_chat, raw_user=raw_user
+                )
 
         run_on_ui_thread(show_picker_dialog)
 
@@ -313,7 +348,7 @@ class CircleCleanerPlugin(BasePlugin):
 
     def _request_stop(self):
         self._cancel_requested = True
-        self._update_progress("⏹️ Остановка процесса удаления...")
+        self._update_progress("⏹️ Остановка процесса...")
 
     def _show_progress(self, activity, title: str, initial_text: str):
         if not activity or not AlertDialogBuilder:
@@ -345,7 +380,16 @@ class CircleCleanerPlugin(BasePlugin):
             run_on_ui_thread(lambda: self._progress_builder.dismiss())
             self._progress_builder = None
 
-    def _start_cleaning(self, activity, account: int, peer_id: int, only_my: bool, limit: int):
+    def _start_cleaning(
+        self,
+        activity,
+        account: int,
+        peer_id: Any,
+        only_my: bool,
+        limit: int,
+        raw_chat: Any = None,
+        raw_user: Any = None,
+    ):
         if self._is_running:
             BulletinHelper.show_error("⚠️ Процесс уже выполняется!")
             return
@@ -362,12 +406,45 @@ class CircleCleanerPlugin(BasePlugin):
 
         threading.Thread(
             target=self._run_cleaner,
-            args=(account, int(peer_id), only_my, limit),
+            args=(account, peer_id, only_my, limit, raw_chat, raw_user),
             daemon=True,
         ).start()
 
-    def _resolve_input_peer(self, account: int, peer_id: int):
-        """Надежное получение InputPeer для MTProto"""
+    def _resolve_input_peer(self, account: int, peer_id: Any, raw_chat: Any = None, raw_user: Any = None):
+        """Надежное получение InputPeer для MTProto с поддержкой прямых объектов и числовых ID"""
+        # 1. Если передан готовый объект Chat (из ChatActivity / context)
+        if raw_chat:
+            try:
+                cid = getattr(raw_chat, "id", 0)
+                access_hash = getattr(raw_chat, "access_hash", 0)
+                try:
+                    from org.telegram.messenger import ChatObject
+                    is_chan = ChatObject.isChannel(raw_chat)
+                except Exception:
+                    is_chan = getattr(raw_chat, "broadcast", False) or getattr(raw_chat, "megagroup", False)
+
+                if is_chan:
+                    inp = TLRPC.TL_inputPeerChannel()
+                    inp.channel_id = cid
+                    inp.access_hash = access_hash
+                    return inp
+                else:
+                    inp = TLRPC.TL_inputPeerChat()
+                    inp.chat_id = cid
+                    return inp
+            except Exception as e:
+                self.logger.warning(f"Failed to resolve from raw_chat: {e}")
+
+        # 2. Если передан готовый объект User (из ChatActivity / context)
+        if raw_user:
+            try:
+                inp = TLRPC.TL_inputPeerUser()
+                inp.user_id = getattr(raw_user, "id", 0)
+                inp.access_hash = getattr(raw_user, "access_hash", 0)
+                return inp
+            except Exception as e:
+                self.logger.warning(f"Failed to resolve from raw_user: {e}")
+
         try:
             controller = get_messages_controller(account)
         except Exception:
@@ -381,31 +458,65 @@ class CircleCleanerPlugin(BasePlugin):
         if not controller:
             return None
 
-        # 1. Попытка через стандартный метод Telegram
-        try:
-            peer = controller.getInputPeer(peer_id)
-            if peer and not isinstance(peer, TLRPC.TL_inputPeerEmpty):
-                return peer
-        except Exception:
-            pass
+        # 3. Попытка через стандартный метод Telegram getInputPeer
+        if peer_id is not None:
+            try:
+                p_id_int = int(peer_id)
+                peer = controller.getInputPeer(p_id_int)
+                if peer and not isinstance(peer, TLRPC.TL_inputPeerEmpty):
+                    access_hash = getattr(peer, "access_hash", None)
+                    if access_hash is not None and access_hash != 0:
+                        return peer
+            except Exception:
+                pass
 
-        # 2. Ручная сборка по типу ID
-        try:
-            if peer_id < 0:
-                chat_id = abs(peer_id)
-                # Если супергруппа или канал (-100xxxxxxxxxx)
-                if chat_id > 1000000000000:
-                    real_channel_id = chat_id - 1000000000000
-                    chat = controller.getChat(real_channel_id)
-                    if chat:
+        # 4. Ручная сборка по числовому значению ID
+        if peer_id is not None:
+            try:
+                did = int(peer_id)
+                if did < 0:
+                    chat_id = abs(did)
+                    # Если супергруппа или канал с префиксом -100xxxxxxxxxx
+                    if chat_id > 1000000000000:
+                        real_cid = chat_id - 1000000000000
+                        chat = controller.getChat(real_cid)
                         inp = TLRPC.TL_inputPeerChannel()
-                        inp.channel_id = chat.id
-                        inp.access_hash = getattr(chat, "access_hash", 0)
+                        inp.channel_id = real_cid
+                        inp.access_hash = getattr(chat, "access_hash", 0) if chat else 0
                         return inp
+                    else:
+                        chat = controller.getChat(chat_id)
+                        if chat:
+                            try:
+                                from org.telegram.messenger import ChatObject
+                                is_chan = ChatObject.isChannel(chat)
+                            except Exception:
+                                is_chan = getattr(chat, "broadcast", False) or getattr(chat, "megagroup", False)
+
+                            if is_chan:
+                                inp = TLRPC.TL_inputPeerChannel()
+                                inp.channel_id = chat.id
+                                inp.access_hash = getattr(chat, "access_hash", 0)
+                                return inp
+                            else:
+                                inp = TLRPC.TL_inputPeerChat()
+                                inp.chat_id = chat.id
+                                return inp
+                        else:
+                            inp = TLRPC.TL_inputPeerChat()
+                            inp.chat_id = chat_id
+                            return inp
                 else:
-                    chat = controller.getChat(chat_id)
+                    # did > 0: может быть как chatId (положительный ID группы), так и userId
+                    chat = controller.getChat(did)
                     if chat:
-                        if getattr(chat, "broadcast", False) or getattr(chat, "megagroup", False):
+                        try:
+                            from org.telegram.messenger import ChatObject
+                            is_chan = ChatObject.isChannel(chat)
+                        except Exception:
+                            is_chan = getattr(chat, "broadcast", False) or getattr(chat, "megagroup", False)
+
+                        if is_chan:
                             inp = TLRPC.TL_inputPeerChannel()
                             inp.channel_id = chat.id
                             inp.access_hash = getattr(chat, "access_hash", 0)
@@ -414,15 +525,15 @@ class CircleCleanerPlugin(BasePlugin):
                             inp = TLRPC.TL_inputPeerChat()
                             inp.chat_id = chat.id
                             return inp
-            else:
-                user = controller.getUser(peer_id)
-                if user:
-                    inp = TLRPC.TL_inputPeerUser()
-                    inp.user_id = user.id
-                    inp.access_hash = getattr(user, "access_hash", 0)
-                    return inp
-        except Exception as e:
-            self.logger.error(f"Manual inputPeer resolution failed: {e}")
+
+                    user = controller.getUser(did)
+                    if user:
+                        inp = TLRPC.TL_inputPeerUser()
+                        inp.user_id = user.id
+                        inp.access_hash = getattr(user, "access_hash", 0)
+                        return inp
+            except Exception as e:
+                self.logger.error(f"Manual inputPeer resolution failed: {e}")
 
         return None
 
@@ -462,7 +573,6 @@ class CircleCleanerPlugin(BasePlugin):
         if req_id == 0:
             raise RuntimeError("Telegram отклонил отправку запроса (код 0).")
 
-        # Цикл ожидания с регулярным сбросом GIL
         start_t = time.time()
         while not box["done"] and not self._cancel_requested:
             if time.time() - start_t > timeout:
@@ -479,7 +589,15 @@ class CircleCleanerPlugin(BasePlugin):
 
         return box["response"]
 
-    def _run_cleaner(self, account: int, peer_id: int, only_my: bool, limit: int):
+    def _run_cleaner(
+        self,
+        account: int,
+        peer_id: Any,
+        only_my: bool,
+        limit: int,
+        raw_chat: Any = None,
+        raw_user: Any = None,
+    ):
         try:
             # 1. Проверяем сеть
             try:
@@ -488,7 +606,7 @@ class CircleCleanerPlugin(BasePlugin):
             except Exception:
                 pass
 
-            input_peer = self._resolve_input_peer(account, peer_id)
+            input_peer = self._resolve_input_peer(account, peer_id, raw_chat=raw_chat, raw_user=raw_user)
             if not input_peer:
                 self._dismiss_progress()
                 BulletinHelper.show_error("❌ Ошибка: не удалось получить данные чата (InputPeer is None)!")
@@ -499,67 +617,74 @@ class CircleCleanerPlugin(BasePlugin):
             self._update_progress(f"🔍 Поиск кружков ({mode_str}){limit_str}...")
 
             collected_ids = []
-            used_fallback = False
+            seen_ids = set()
 
-            # 2. Первичный поиск через TL_messages_search
-            offset_id = 0
-            while not self._cancel_requested:
-                req = TLRPC.TL_messages_search()
-                req.peer = input_peer
-                req.q = ""
-                req.filter = TLRPC.TL_inputMessagesFilterRoundVoice()
-                req.offset_id = int(offset_id)
-                req.limit = 100
+            # 2. Быстрый серверный поиск через TL_messages_search
+            filter_cls = (
+                getattr(TLRPC, "TL_inputMessagesFilterRoundVideo", None)
+                or getattr(TLRPC, "TL_inputMessagesFilterRoundVoice", None)
+            )
 
-                try:
-                    res = self._send_mtproto(req, account=account, timeout=10.0)
-                except Exception as e:
-                    self.logger.warning(f"Filter search timed out or failed: {e}. Switching to chat history scan.")
-                    used_fallback = True
-                    break
+            if filter_cls:
+                offset_id = 0
+                while not self._cancel_requested:
+                    req = TLRPC.TL_messages_search()
+                    req.peer = input_peer
+                    req.q = ""
+                    req.filter = filter_cls()
+                    req.offset_id = int(offset_id)
+                    req.limit = 100
 
-                messages = getattr(res, "messages", None)
-                if not messages or messages.isEmpty():
-                    break
-
-                msg_count = messages.size()
-                new_offset = offset_id
-
-                for i in range(msg_count):
-                    if self._cancel_requested:
+                    try:
+                        res = self._send_mtproto(req, account=account, timeout=10.0)
+                    except Exception as e:
+                        self.logger.warning(f"Filter search failed/timed out: {e}")
                         break
 
-                    msg = messages.get(i)
-                    if not msg:
-                        continue
+                    messages = getattr(res, "messages", None)
+                    if not messages or messages.isEmpty():
+                        break
 
-                    mid = getattr(msg, "id", 0)
-                    if mid > 0:
-                        new_offset = min(new_offset, mid) if new_offset > 0 else mid
+                    msg_count = messages.size()
+                    new_offset = offset_id
 
-                    if not self._is_round_video(msg):
-                        continue
+                    for i in range(msg_count):
+                        if self._cancel_requested:
+                            break
+                        msg = messages.get(i)
+                        if not msg:
+                            continue
 
-                    if only_my and not getattr(msg, "out", False):
-                        continue
+                        mid = getattr(msg, "id", 0)
+                        if mid > 0:
+                            new_offset = min(new_offset, mid) if new_offset > 0 else mid
 
-                    collected_ids.append(mid)
+                        if not self._is_round_video(msg):
+                            continue
+                        if only_my and not getattr(msg, "out", False):
+                            continue
+
+                        if mid not in seen_ids:
+                            seen_ids.add(mid)
+                            collected_ids.append(mid)
+
+                        if limit > 0 and len(collected_ids) >= limit:
+                            break
+
+                    self._update_progress(f"🔍 Быстрый поиск...\nНайдено кружков: {len(collected_ids)}")
+
                     if limit > 0 and len(collected_ids) >= limit:
                         break
+                    if msg_count < 100 or new_offset == offset_id:
+                        break
 
-                self._update_progress(f"🔍 Поиск кружков...\nНайдено: {len(collected_ids)}")
+                    offset_id = new_offset
+                    time.sleep(0.05)
 
-                if limit > 0 and len(collected_ids) >= limit:
-                    break
-                if msg_count < 100 or new_offset == offset_id:
-                    break
-
-                offset_id = new_offset
-                time.sleep(0.1)
-
-            # 3. Фоллбэк: если серверный поиск не ответил из-за VPN, сканируем историю напрямую через getHistory
-            if used_fallback and not self._cancel_requested:
-                self._update_progress("Поиск по фильтру не ответил.\nСканирование истории сообщений...")
+            # 3. Глубокое сканирование через TL_messages_getHistory
+            # ЕСЛИ быстрый поиск вернул 0 результатов (или сервер не поддерживает фильтр в этом чате)
+            if len(collected_ids) == 0 and not self._cancel_requested:
+                self._update_progress("Поиск по фильтру не дал результатов.\nСканирование истории сообщений...")
                 offset_id = 0
                 scanned_total = 0
 
@@ -578,6 +703,8 @@ class CircleCleanerPlugin(BasePlugin):
                         h_res = self._send_mtproto(h_req, account=account, timeout=12.0)
                     except Exception as e:
                         self.logger.error(f"getHistory failed: {e}")
+                        if scanned_total == 0:
+                            raise e
                         break
 
                     msgs = getattr(h_res, "messages", None)
@@ -588,7 +715,12 @@ class CircleCleanerPlugin(BasePlugin):
                     new_offset = offset_id
 
                     for i in range(m_count):
+                        if self._cancel_requested:
+                            break
                         m = msgs.get(i)
+                        if not m:
+                            continue
+
                         scanned_total += 1
                         mid = getattr(m, "id", 0)
                         if mid > 0:
@@ -599,12 +731,17 @@ class CircleCleanerPlugin(BasePlugin):
                         if only_my and not getattr(m, "out", False):
                             continue
 
-                        collected_ids.append(mid)
+                        if mid not in seen_ids:
+                            seen_ids.add(mid)
+                            collected_ids.append(mid)
+
                         if limit > 0 and len(collected_ids) >= limit:
                             break
 
                     self._update_progress(
-                        f"Сканирование истории...\nПроверено сообщений: {scanned_total}\nНайдено кружков: {len(collected_ids)}"
+                        f"🔍 Сканирование истории сообщений...\n"
+                        f"Проверено сообщений: {scanned_total}\n"
+                        f"Найдено кружков: {len(collected_ids)}"
                     )
 
                     if limit > 0 and len(collected_ids) >= limit:
@@ -613,7 +750,7 @@ class CircleCleanerPlugin(BasePlugin):
                         break
 
                     offset_id = new_offset
-                    time.sleep(0.1)
+                    time.sleep(0.05)
 
             if self._cancel_requested:
                 self._dismiss_progress()
@@ -631,6 +768,12 @@ class CircleCleanerPlugin(BasePlugin):
             deleted_count = 0
             chunk_size = 100
 
+            is_channel = (
+                isinstance(input_peer, TLRPC.TL_inputPeerChannel)
+                or hasattr(input_peer, "channel_id")
+                or "Channel" in type(input_peer).__name__
+            )
+
             for chunk_start in range(0, total_found, chunk_size):
                 if self._cancel_requested:
                     break
@@ -642,19 +785,29 @@ class CircleCleanerPlugin(BasePlugin):
                     f"Пачка {chunk_start // chunk_size + 1} из {(total_found + chunk_size - 1) // chunk_size}..."
                 )
 
-                if isinstance(input_peer, TLRPC.TL_inputPeerChannel):
+                if is_channel:
                     del_req = TLRPC.TL_channels_deleteMessages()
                     inp_chan = TLRPC.TL_inputChannel()
-                    inp_chan.channel_id = input_peer.channel_id
-                    inp_chan.access_hash = input_peer.access_hash
+                    inp_chan.channel_id = getattr(input_peer, "channel_id", 0)
+                    inp_chan.access_hash = getattr(input_peer, "access_hash", 0)
                     del_req.channel = inp_chan
-                    for mid in chunk:
-                        del_req.id.add(int(mid))
+                    try:
+                        from java.lang import Integer as JavaInt
+                        for mid in chunk:
+                            del_req.id.add(JavaInt(int(mid)))
+                    except Exception:
+                        for mid in chunk:
+                            del_req.id.add(int(mid))
                 else:
                     del_req = TLRPC.TL_messages_deleteMessages()
                     del_req.revoke = revoke_flag
-                    for mid in chunk:
-                        del_req.id.add(int(mid))
+                    try:
+                        from java.lang import Integer as JavaInt
+                        for mid in chunk:
+                            del_req.id.add(JavaInt(int(mid)))
+                    except Exception:
+                        for mid in chunk:
+                            del_req.id.add(int(mid))
 
                 try:
                     self._send_mtproto(del_req, account=account, timeout=15.0)
@@ -665,7 +818,7 @@ class CircleCleanerPlugin(BasePlugin):
                     BulletinHelper.show_error(f"❌ Ошибка при удалении: {e}\n(Удалено: {deleted_count})")
                     return
 
-                time.sleep(0.3)
+                time.sleep(0.2)
 
             self._dismiss_progress()
 
@@ -685,23 +838,70 @@ class CircleCleanerPlugin(BasePlugin):
             self._dismiss_progress()
 
     def _is_round_video(self, msg) -> bool:
-        """Проверяет, является ли сообщение видеосообщением (кружком)"""
-        media = getattr(msg, "media", None)
-        if not media:
+        """
+        Проверяет, является ли сообщение видеосообщением (кружком).
+        Использует множество проверок:
+        1. MessageObject.isRoundVideo()
+        2. MessageObject.isRoundVideoMessage()
+        3. MessageObject.isRoundVideoDocument()
+        4. document.attributes: round_message flag
+        """
+        if not msg:
             return False
-        doc = getattr(media, "document", None)
-        if not doc:
-            return False
-        attrs = getattr(doc, "attributes", None)
-        if not attrs:
-            return False
+
+        # 1. Если это MessageObject (из Telegram UI)
         try:
+            if hasattr(msg, "isRoundVideo") and callable(msg.isRoundVideo):
+                if msg.isRoundVideo():
+                    return True
+        except Exception:
+            pass
+
+        raw_msg = getattr(msg, "messageOwner", msg)
+
+        # 2. Через нативный метод Telegram MessageObject.isRoundVideoMessage
+        try:
+            from org.telegram.messenger import MessageObject
+            if MessageObject.isRoundVideoMessage(raw_msg):
+                return True
+        except Exception:
+            pass
+
+        # 3. Через нативный метод MessageObject.isRoundVideoDocument
+        try:
+            from org.telegram.messenger import MessageObject
+            doc = getattr(getattr(raw_msg, "media", None), "document", None)
+            if doc and hasattr(MessageObject, "isRoundVideoDocument"):
+                if MessageObject.isRoundVideoDocument(doc):
+                    return True
+        except Exception:
+            pass
+
+        # 4. Проверка через медиа и атрибуты документа MTProto
+        try:
+            media = getattr(raw_msg, "media", None)
+            if not media:
+                return False
+            doc = getattr(media, "document", None)
+            if not doc:
+                return False
+            attrs = getattr(doc, "attributes", None)
+            if not attrs:
+                return False
+
             size = attrs.size() if hasattr(attrs, "size") else len(attrs)
             for i in range(size):
                 attr = attrs.get(i) if hasattr(attrs, "get") else attrs[i]
-                if isinstance(attr, TLRPC.TL_documentAttributeVideo):
-                    if getattr(attr, "round_message", False):
-                        return True
+                if not attr:
+                    continue
+
+                if getattr(attr, "round_message", False):
+                    return True
+
+                cls_name = getattr(attr, "__class__", type(attr)).__name__
+                if "Video" in cls_name and getattr(attr, "round_message", False):
+                    return True
         except Exception:
-            return False
+            pass
+
         return False
