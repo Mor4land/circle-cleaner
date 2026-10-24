@@ -1,7 +1,7 @@
 """
 Circle Cleaner Plugin for exteraGram / AyuGram (Android)
 Удаление видеосообщений (кружков) через кнопку Plugins в чате или текстовой командой.
-Построен на нативном механизме Telegram MessagesController.deleteMessages с защитой от ошибок сигнатур.
+Надежное удаление через Telegram MessagesController с визуальным прогресс-баром и гарантированным закрытием диалога.
 """
 
 import threading
@@ -29,7 +29,7 @@ __id__ = "circle_cleaner"
 __name__ = "Circle Cleaner"
 __description__ = "Удаление видеосообщений (кружков) из чата через кнопку меню Plugins или команду"
 __author__ = "VANTA"
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.0.0"
 __permissions__ = ["network"]
@@ -87,7 +87,8 @@ class CircleCleanerPlugin(BasePlugin):
         self._is_running = False
         self._cancel_requested = False
         self._progress_builder = None
-        self.logger.info("Circle Cleaner v1.5.1 loaded successfully!")
+        self._progress_dialog = None
+        self.logger.info("Circle Cleaner v1.5.2 loaded successfully!")
 
     def on_plugin_unload(self):
         self._cancel_requested = True
@@ -162,8 +163,7 @@ class CircleCleanerPlugin(BasePlugin):
             if self._is_running:
                 def show_stop_dialog():
                     if not activity or not AlertDialogBuilder:
-                        self._cancel_requested = True
-                        BulletinHelper.show_info("Остановка процесса удаления...")
+                        self._request_stop()
                         return
 
                     try:
@@ -276,37 +276,74 @@ class CircleCleanerPlugin(BasePlugin):
 
     def _request_stop(self):
         self._cancel_requested = True
-        self._update_progress("⏹️ Остановка процесса...")
+        self._dismiss_progress()
+        BulletinHelper.show_info("⏹️ Остановка процесса...")
 
     def _show_progress(self, activity, title: str, initial_text: str):
         if not activity or not AlertDialogBuilder:
-            return None
+            return None, None
         try:
             builder = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
             builder.set_title(title)
             builder.set_message(initial_text)
             builder.set_positive_button(
                 "Остановить",
-                lambda bld, which: (bld.dismiss(), self._request_stop())
+                lambda bld, which: self._request_stop()
             )
-            builder.show()
             builder.set_cancelable(True)
-            builder.set_on_back_button_listener(lambda bld, which: (bld.dismiss(), self._request_stop()))
-            return builder
-        except Exception as e:
-            self.logger.warning(f"Could not show progress dialog: {e}")
-            return None
+            builder.set_on_back_button_listener(lambda bld, which: self._request_stop())
 
-    def _update_progress(self, text: str):
-        if self._progress_builder:
-            run_on_ui_thread(lambda: self._progress_builder.set_message(text))
-        else:
+            dialog = builder.show()
+            if not dialog:
+                dialog = getattr(builder, "dialog", None) or getattr(builder, "alert_dialog", None)
+            return builder, dialog
+        except Exception as e:
+            log(f"Could not show progress dialog: {e}")
+            return None, None
+
+    def _update_progress(self, text: str, percent: int = -1):
+        def do_update():
+            # 1. Попытка обновить текст нативного AlertDialog
+            for target in (self._progress_dialog, self._progress_builder):
+                if not target:
+                    continue
+                for method_name in ("setMessage", "set_message", "setText"):
+                    if hasattr(target, method_name):
+                        try:
+                            getattr(target, method_name)(text)
+                            break
+                        except Exception:
+                            pass
+                if percent >= 0 and hasattr(target, "setProgress"):
+                    try:
+                        target.setProgress(percent)
+                    except Exception:
+                        pass
+
+            # 2. Обновление плавающего уведомления BulletinHelper
             BulletinHelper.show_info(text)
 
+        run_on_ui_thread(do_update)
+
     def _dismiss_progress(self):
-        if self._progress_builder:
-            run_on_ui_thread(lambda: self._progress_builder.dismiss())
-            self._progress_builder = None
+        builder = self._progress_builder
+        dialog = self._progress_dialog
+        self._progress_builder = None
+        self._progress_dialog = None
+
+        def do_dismiss():
+            for obj in (dialog, builder):
+                if not obj:
+                    continue
+                for method_name in ("dismiss", "cancel", "hide"):
+                    if hasattr(obj, method_name):
+                        try:
+                            getattr(obj, method_name)()
+                            break
+                        except Exception as e:
+                            log(f"Error dismissing {obj}: {e}")
+
+        run_on_ui_thread(do_dismiss)
 
     def _start_cleaning(self, activity, account: int, dialog_id: int, only_my: bool, limit: int):
         if self._is_running:
@@ -316,10 +353,10 @@ class CircleCleanerPlugin(BasePlugin):
         self._is_running = True
         self._cancel_requested = False
 
-        self._progress_builder = self._show_progress(
+        self._progress_builder, self._progress_dialog = self._show_progress(
             activity,
             "Circle Cleaner",
-            "Инициализация поиска видеосообщений..."
+            "🔍 Инициализация поиска кружков..."
         )
 
         threading.Thread(
@@ -574,10 +611,13 @@ class CircleCleanerPlugin(BasePlugin):
                         if limit > 0 and len(collected_ids) >= limit:
                             break
 
+                    found_len = len(collected_ids)
+                    bar_blocks = min(10, found_len)
+                    scan_bar = f"[{'█' * bar_blocks}{'░' * (10 - bar_blocks)}]"
                     self._update_progress(
-                        f"🔍 Сканирование сообщений...\n"
-                        f"Проверено сообщений: {scanned_total}\n"
-                        f"Найдено кружков: {len(collected_ids)}"
+                        f"🔍 Сканирование истории...\n"
+                        f"{scan_bar}\n"
+                        f"Проверено: {scanned_total} | Найдено кружков: {found_len}"
                     )
 
                     if limit > 0 and len(collected_ids) >= limit:
@@ -605,7 +645,7 @@ class CircleCleanerPlugin(BasePlugin):
                 BulletinHelper.show_info(f"ℹ️ Кружков ({mode_str}) в этом чате не найдено.")
                 return
 
-            # 3. Удаление сообщений через надежный delete_batch
+            # 3. Удаление сообщений через надежный delete_batch с живым прогресс-баром
             revoke_flag = self.get_setting("revoke", True)
             deleted_count = 0
             chunk_size = 100
@@ -616,10 +656,14 @@ class CircleCleanerPlugin(BasePlugin):
 
                 chunk = collected_ids[chunk_start : chunk_start + chunk_size]
                 percent = int((deleted_count / total_found) * 100) if total_found > 0 else 0
-                self._update_progress(
-                    f"🗑️ Удаление кружков: {deleted_count}/{total_found} ({percent}%)\n"
-                    f"Пачка {chunk_start // chunk_size + 1} из {(total_found + chunk_size - 1) // chunk_size}..."
+                bar_filled = min(10, percent // 10)
+                progress_bar = f"[{'█' * bar_filled}{'░' * (10 - bar_filled)}] {percent}%"
+                status_text = (
+                    f"🗑️ Удаление кружков:\n"
+                    f"{progress_bar}\n"
+                    f"Удалено: {deleted_count} из {total_found}"
                 )
+                self._update_progress(status_text, percent=percent)
 
                 try:
                     self.delete_batch(account, dialog_id, chunk, revoke=revoke_flag)
